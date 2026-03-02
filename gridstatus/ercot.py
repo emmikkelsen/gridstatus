@@ -2,11 +2,13 @@ import datetime
 import io
 import time
 from dataclasses import dataclass
+from datetime import timedelta
 from enum import Enum
 from typing import BinaryIO, Callable, List, Literal
 from zipfile import ZipFile
 
 import pandas as pd
+import polars as pl
 import pytz
 import requests
 import tqdm
@@ -5048,7 +5050,7 @@ class Ercot(ISOBase):
             )
         return pd.concat(dfs).reset_index(drop=True)
 
-    def ambiguous_based_on_dstflag(self, df: pd.DataFrame) -> pd.Series:
+    def ambiguous_based_on_dstflag(self, df: pl.DataFrame) -> pl.Series:
         # DSTFlag is Y during the repeated hour (after the clock has been set back)
         # so it's False/N during DST And True/Y during Standard Time.
         # For ambiguous, Pandas wants True for DST and False for Standard Time
@@ -5065,16 +5067,16 @@ class Ercot(ISOBase):
 
     def parse_doc(
         self,
-        doc: pd.DataFrame,
+        doc: pl.DataFrame,
         dst_ambiguous_default: str = "infer",
         verbose: bool = False,
         nonexistent: str = "raise",
-    ) -> pd.DataFrame:
+    ) -> pl.DataFrame:
         # files sometimes have different naming conventions
         # a more elegant solution would be nice
 
-        doc.rename(
-            columns={
+        doc = doc.rename(
+            {
                 "deliveryDate": "DeliveryDate",
                 "Delivery Date": "DeliveryDate",
                 "DELIVERY_DATE": "DeliveryDate",
@@ -5091,59 +5093,65 @@ class Ercot(ISOBase):
                 # fix whitespace in column name
                 "DSTFlag    ": "DSTFlag",
             },
-            inplace=True,
+            strict=False,
         )
 
-        original_cols = doc.columns.tolist()
+        original_cols = doc.columns
 
         ending_time_col_name = "HourEnding"
 
         ambiguous = dst_ambiguous_default
         if "DSTFlag" in doc.columns:
             ambiguous = self.ambiguous_based_on_dstflag(doc)
-
+        print(doc)
         # i think DeliveryInterval only shows up
         # in 15 minute data along with DeliveryHour
         if "DeliveryInterval" in original_cols:
-            interval_length = pd.Timedelta(minutes=15)
+            interval_length = timedelta(minutes=15)
 
-            doc["HourBeginning"] = doc[ending_time_col_name] - 1
+            doc = doc.with_columns(HourBeginning=pl.col(ending_time_col_name) - 1)
 
-            doc["Interval Start"] = (
-                pd.to_datetime(doc["DeliveryDate"])
-                + doc["HourBeginning"].astype("timedelta64[h]")
-                + ((doc["DeliveryInterval"] - 1) * interval_length)
+            doc.with_columns(
+                (
+                    pl.col("DeliveryDate").str.strptime(pl.Datetime, "%m/%d/%Y")
+                    + timedelta(hours=1) * pl.col("HourBeginning")
+                    + (pl.col("DeliveryInterval") - 1) * interval_length
+                    # type: ignore
+                ).alias("Interval Start")
             )
 
         # 15-minute system wide actuals
         elif "TimeEnding" in original_cols:
             ending_time_col_name = "TimeEnding"
-            interval_length = pd.Timedelta(minutes=15)
+            interval_length = timedelta(minutes=15)
 
-            doc["Interval End"] = pd.to_datetime(
-                doc["DeliveryDate"] + " " + doc["TimeEnding"] + ":00",
+            doc = doc.with_columns(
+                (
+                    pl.col("DeliveryDate").str.strptime(pl.Datetime, "%m/%d/%Y")
+                    + pl.col("TimeEnding").str.strptime(pl.Time, "%H:%M")
+                )
+                .dt.replace_time_zone(
+                    self.default_timezone,
+                    ambiguous=ambiguous,
+                )
+                .alias("Interval End")
             )
-            doc["Interval End"] = doc["Interval End"].dt.tz_localize(
-                self.default_timezone,
-                ambiguous=ambiguous,
+            doc = doc.with_columns(
+                pl.col("Interval End") - interval_length,
+            ).with_columns(
+                (pl.col("Interval End") - interval_length).alias("Interval Start")
             )
-            doc["Interval Start"] = doc["Interval End"] - interval_length
-
         else:
             interval_length = pd.Timedelta(hours=1)
-            doc["HourBeginning"] = (
-                doc[ending_time_col_name]
-                .astype(str)
-                .str.split(
-                    ":",
-                )
-                .str[0]
-                .astype(int)
-                - 1
+            doc = doc.with_columns(HourBeginning=pl.col(ending_time_col_name) - 1)
+
+            doc = doc.with_columns(
+                (
+                    pl.col("DeliveryDate").str.strptime(pl.Datetime, "%m/%d/%Y")
+                    + pl.col("HourBeginning").cast(pl.Int32)
+                    * pl.lit(pd.Timedelta(hours=1))
+                ).alias("Interval Start")
             )
-            doc["Interval Start"] = pd.to_datetime(doc["DeliveryDate"]) + doc[
-                "HourBeginning"
-            ].astype("timedelta64[h]")
 
         if "TimeEnding" not in original_cols:
             try:

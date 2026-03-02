@@ -1,14 +1,19 @@
 import argparse
+import io
 import json
 import os
 import random
 import time
+from datetime import datetime, timedelta
 from enum import StrEnum
+from fileinput import filename
 from typing import Dict
 from zipfile import ZipFile
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
+import polars as pl
 import pytz
 import requests
 import requests.status_codes as status_codes
@@ -175,7 +180,7 @@ class ErcotAPI:
     To obtain a subscription key, follow the instructions here: https://developer.ercot.com/applications/pubapi/ERCOT%20Public%20API%20Registration%20and%20Authentication/
     """  # noqa
 
-    default_timezone = "US/Central"
+    default_timezone = ZoneInfo("America/Chicago")
 
     def __init__(
         self,
@@ -222,12 +227,14 @@ class ErcotAPI:
         self.batch_size = min(max(1, batch_size), 1_000)
 
     def _local_now(self):
-        return pd.Timestamp("now", tz=self.default_timezone)
+        return datetime.now(tz=self.default_timezone)
 
     def _local_start_of_today(self):
-        return pd.Timestamp("now", tz=self.default_timezone).floor("d")
+        return self._local_now().replace(hour=0, minute=0, second=0, microsecond=0)
 
-    def _handle_end_date(self, date, end, days_to_add_if_no_end):
+    def _handle_end_date(
+        self, date: datetime, end: datetime | None, days_to_add_if_no_end: int
+    ) -> datetime:
         """
         Handles a provided end date by either
 
@@ -239,12 +246,7 @@ class ErcotAPI:
         else:
             # Have to convert to UTC to do addition, then convert back to local time
             # to avoid DST issues
-            end = (
-                (date.tz_convert("UTC") + pd.DateOffset(days=days_to_add_if_no_end))
-                .normalize()
-                .tz_localize(None)
-                .tz_localize(self.default_timezone)
-            )
+            end = date + timedelta(days=days_to_add_if_no_end)
 
         return end
 
@@ -390,7 +392,7 @@ class ErcotAPI:
             verbose (bool, optional): print verbose output. Defaults to False.
 
         Returns:
-            pandas.DataFrame: A DataFrame with hourly wind power production reports
+            polars.DataFrame: A DataFrame with hourly wind power production reports
         """
         return self._get_wind_actual_and_forecast_hourly(
             endpoint=HOURLY_WIND_POWER_PRODUCTION_BY_GEOGRAPHICAL_REGION_ENDPOINT,
@@ -410,7 +412,7 @@ class ErcotAPI:
         verbose=False,
     ):
         if date == "latest":
-            date = self._local_now() - pd.Timedelta(hours=1)
+            date = self._local_now() - timedelta(hours=1)
             end = self._local_now()
 
         end = self._handle_end_date(date, end, days_to_add_if_no_end=1)
@@ -481,12 +483,14 @@ class ErcotAPI:
 
         return result
 
-    def _handle_wind_actual_and_forecast_hourly(self, data, columns, verbose=False):
+    def _handle_wind_actual_and_forecast_hourly(
+        self, data: pl.DataFrame, columns, verbose=False
+    ):
         # Store raw data before parse_doc to check for xhr in filename
-        raw_data = data.copy()
+        raw_data = data
         data = Ercot().parse_doc(data, verbose=verbose)
 
-        data.columns = data.columns.str.replace("_", " ")
+        data = data.rename(columns=lambda x: x.replace("_", " "))
 
         try:
             data["Publish Time"] = pd.to_datetime(data["postDatetime"]).dt.tz_localize(
@@ -1720,15 +1724,15 @@ class ErcotAPI:
     def get_historical_data(
         self,
         endpoint: str,
-        start_date: str | pd.Timestamp | tuple[pd.Timestamp, pd.Timestamp],
-        end_date: str | pd.Timestamp | tuple[pd.Timestamp, pd.Timestamp] | None = None,
+        start_date: str | datetime | tuple[datetime, datetime],
+        end_date: str | datetime | tuple[datetime, datetime] | None = None,
         read_as_csv: bool = True,
         add_post_datetime: bool = False,
         verbose: bool = False,
         bulk_download: bool = True,
         include_source_filename: bool = False,
         api: APITypeEnum = APITypeEnum.PUBLIC_API,
-    ) -> pd.DataFrame | bytes:
+    ) -> pl.DataFrame | bytes:
         """Retrieves historical data from the given emil_id from start to end date.
         The historical data endpoint only allows filtering by the postDatetimeTo and
         postDatetimeFrom parameters. The retrieval process has two steps:
@@ -1806,21 +1810,31 @@ class ErcotAPI:
                 bytes_data = file_data
                 filename = None
 
-            df = pd.read_csv(bytes_data, compression="zip")
-            if add_post_datetime:
-                df["postDatetime"] = posted_datetime
-            if include_source_filename:
-                # Store filename for xhr detection (prefer filename from zip, fallback to link)
-                df["_source_filename"] = filename if filename else link
-            dfs.append(df)
+            zip_file_obj = ZipFile(bytes_data)
+            for inner_file in zip_file_obj.namelist():
+                with zip_file_obj.open(inner_file) as f:
+                    df = pl.read_csv(f, try_parse_dates=True)
+                    if add_post_datetime:
+                        df = df.with_columns(
+                            pl.lit(posted_datetime).alias("postDatetime")
+                        )
+                    if include_source_filename:
+                        # Store filename for xhr detection (prefer filename from zip, fallback to link)
+                        df = df.with_columns(
+                            pl.lit(filename if filename else link).alias(
+                                "_source_filename"
+                            )
+                        )
 
-        return pd.concat(dfs)
+                    dfs.append(df)
+
+        return pl.concat(dfs)
 
     def _individually_download_documents(
         self,
         links: list[str],
         verbose: bool = False,
-    ) -> list[pd.io.common.BytesIO]:
+    ) -> list[bytes]:
         retries = 0
         max_retries = 3
         documents = []
@@ -1838,7 +1852,7 @@ class ErcotAPI:
                         parse_json=False,
                     )
 
-                    bytes = pd.io.common.BytesIO(response)
+                    bytes = response
 
                     documents.append(bytes)
                     time.sleep(self.sleep_seconds)
@@ -1868,7 +1882,7 @@ class ErcotAPI:
         doc_ids: list[str],
         emil_id: str,
         api: APITypeEnum = APITypeEnum.PUBLIC_API,
-    ) -> list[tuple[pd.io.common.BytesIO, str]]:
+    ) -> list[tuple[io.BytesIO, str]]:
         documents = []
         doc_id_batches = [
             doc_ids[i : i + self.batch_size]
@@ -1886,7 +1900,7 @@ class ErcotAPI:
                 method="POST",
             )
 
-            with ZipFile(pd.io.common.BytesIO(response)) as outer_zip:
+            with ZipFile(io.BytesIO(response)) as outer_zip:
                 file_list = outer_zip.namelist()
                 logger.debug(
                     f"Received zip file with {len(file_list)} files",
@@ -1900,7 +1914,7 @@ class ErcotAPI:
                     doc_index = doc_ids.index(doc_id)
                     with outer_zip.open(inner_zip_name) as inner_zip_file:
                         documents[doc_index] = (
-                            pd.io.common.BytesIO(inner_zip_file.read()),
+                            io.BytesIO(inner_zip_file.read()),
                             inner_zip_name,  # Store filename for xhr detection
                         )
 

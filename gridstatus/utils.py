@@ -1,8 +1,10 @@
 import glob
 import io
 import os
+from datetime import datetime
 from typing import Callable
 from zipfile import ZipFile
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import requests
@@ -102,24 +104,24 @@ def make_availability_table() -> str:
 
 
 def _handle_date(
-    date: str | pd.Timestamp | None,
-    tz: str | None = None,
-) -> pd.Timestamp | None:
+    date: datetime | str | None,
+    tz: ZoneInfo,
+) -> datetime:
     if date is None:
         return date
 
     if date == "today":
-        date = pd.Timestamp.now(tz=tz).normalize()
+        date = datetime.now(tz=tz)
 
-    if not isinstance(date, pd.Timestamp):
-        date = pd.to_datetime(date)
+    if isinstance(date, str):
+        date = datetime.fromisoformat(date)
 
     if tz:
         if date.tzinfo is None:
-            date = date.tz_localize(tz)
+            date = date.replace(tzinfo=tz)
         else:
             # todo see if this triggers in tests
-            date = date.tz_convert(tz)
+            date = date.astimezone(tz)
 
     return date
 
