@@ -481,10 +481,12 @@ class ErcotAPI:
 
         return result
 
-    def _handle_wind_actual_and_forecast_hourly(self, data, columns, verbose=False):
+    def _handle_wind_actual_and_forecast_hourly(
+        self, data, columns, verbose=False, nonexistent="NaT"
+    ):
         # Store raw data before parse_doc to check for xhr in filename
         raw_data = data.copy()
-        data = Ercot().parse_doc(data, verbose=verbose)
+        data = Ercot().parse_doc(data, verbose=verbose, nonexistent=nonexistent)
 
         data.columns = data.columns.str.replace("_", " ")
 
@@ -594,10 +596,12 @@ class ErcotAPI:
             verbose=verbose,
         )
 
-    def _handle_solar_actual_and_forecast_hourly(self, data, columns, verbose=False):
+    def _handle_solar_actual_and_forecast_hourly(
+        self, data, columns, verbose=False, nonexistent="NaT"
+    ):
         # Store raw data before parse_doc to check for xhr in filename
         raw_data = data.copy()
-        data = Ercot().parse_doc(data, verbose=verbose)
+        data = Ercot().parse_doc(data, verbose=verbose, nonexistent=nonexistent)
 
         data.columns = data.columns.str.replace("_", " ")
 
@@ -637,6 +641,7 @@ class ErcotAPI:
         date: str | pd.Timestamp,
         end: str | pd.Timestamp | None = None,
         verbose: bool = False,
+        nonexistent="NaT",
     ) -> pd.DataFrame:
         """Get Seven-Day Load Forecast by Model and Weather Zone.
 
@@ -664,7 +669,7 @@ class ErcotAPI:
             add_post_datetime=True,
         )
 
-        data = Ercot().parse_doc(data, verbose=verbose)
+        data = Ercot().parse_doc(data, verbose=verbose, nonexistent=nonexistent)
 
         try:
             publish_time = pd.to_datetime(data["postDatetime"]).dt.tz_localize(
@@ -962,7 +967,7 @@ class ErcotAPI:
         return pd.concat(dfs).reset_index(drop=True).sort_values("SCED Timestamp")
 
     @support_date_range(frequency=None)
-    def get_as_plan(self, date, end=None, verbose=False):
+    def get_as_plan(self, date, end=None, verbose=False, nonexistent="NaT"):
         """Get Ancillary Service requirements by type and quantity for each hour of the
         current day plus the next 6 days.
 
@@ -988,7 +993,7 @@ class ErcotAPI:
             verbose=verbose,
         )
 
-        df = Ercot().parse_doc(data)
+        df = Ercot().parse_doc(data, nonexistent="NaT", verbose=verbose)
         df["Publish Time"] = pd.to_datetime(df["postDatetime"])
 
         return Ercot()._handle_as_plan(df)
@@ -1417,13 +1422,16 @@ class ErcotAPI:
         }
 
     @support_date_range(frequency=None)
-    def get_spp_real_time_15_min(self, date, end=None, verbose=False):
+    def get_spp_real_time_15_min(
+        self, date, end=None, verbose=False, nonexistent="NaT"
+    ):
         """Get Real Time 15-Minute Settlement Point Prices
 
         Arguments:
             date (str): the date to fetch prices for.
             end (str, optional): the end date to fetch prices for. Defaults to None.
             verbose (bool, optional): print verbose output. Defaults to False.
+            nonexistent (str, optional): how to handle nonexistent values. Defaults to "NaT".
 
         Returns:
             pandas.DataFrame: A DataFrame with settlement point prices
@@ -1441,7 +1449,7 @@ class ErcotAPI:
             verbose=verbose,
         )
 
-        data = Ercot().parse_doc(data, verbose=verbose)
+        data = Ercot().parse_doc(data, verbose=verbose, nonexistent=nonexistent)
 
         data = Ercot()._finalize_spp_df(
             data,
@@ -1454,7 +1462,9 @@ class ErcotAPI:
         return data.sort_values(["Interval Start", "Location"]).reset_index(drop=True)
 
     @support_date_range(frequency=None)
-    def get_spp_day_ahead_hourly(self, date, end=None, verbose=False):
+    def get_spp_day_ahead_hourly(
+        self, date, end=None, verbose=False, nonexistent="NaT"
+    ):
         """Get Day Ahead Hourly Settlement Point Prices
 
         Arguments:
@@ -1481,7 +1491,7 @@ class ErcotAPI:
             verbose=verbose,
         )
 
-        data = Ercot().parse_doc(data, verbose=verbose)
+        data = Ercot().parse_doc(data, verbose=verbose, nonexistent=nonexistent)
 
         data = Ercot()._finalize_spp_df(
             data,
@@ -1634,6 +1644,7 @@ class ErcotAPI:
         date: str | pd.Timestamp,
         end: str | pd.Timestamp = None,
         verbose: bool = False,
+        nonexistent="NaT",
     ) -> pd.DataFrame:
         # Reports are delayed by 60 days
         date = date + pd.DateOffset(days=60)
@@ -1653,7 +1664,7 @@ class ErcotAPI:
             add_post_datetime=False,
         )
 
-        data = Ercot().parse_doc(raw_data)
+        data = Ercot().parse_doc(raw_data, nonexistent=nonexistent, verbose=verbose)
 
         return Ercot()._process_cop_adjustment_period_snapshot_60_day_data(data)
 
